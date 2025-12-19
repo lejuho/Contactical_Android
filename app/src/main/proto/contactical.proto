@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+// [중요] 패키지명을 서버와 맞춰야 통신이 됩니다.
+package contactical.reality.v1;
+
+option java_package = "com.example.contacticalattestation.v1";
+option java_multiple_files = true;
+
+// 1. 서비스 이름 변경: ContacticalService -> Msg
+service Msg {
+  // 메서드 이름 변경: RegisterNode (그대로 유지되지만 서비스가 바뀜)
+  rpc RegisterNode(MsgRegisterNode) returns (MsgRegisterNodeResponse);
+
+  // 데이터 제출용 (나중에 사용)
+  rpc CreateClaim(MsgCreateClaim) returns (MsgCreateClaimResponse);
+}
+
+// 2. 메시지 이름 변경: RegisterNodeRequest -> MsgRegisterNode
+message MsgRegisterNode {
+  string creator = 1;
+  repeated string cert_chain = 2; // 리스트 형태
+  string challenge = 3;
+  string pub_key = 4;
+}
+
+message MsgRegisterNodeResponse {
+  bool success = 1;
+}
+
+// 3. 메시지 이름 변경: SubmitDataRequest -> MsgCreateClaim
+message MsgCreateClaim {
+  string creator = 1;
+  string sensor_hash = 2;
+  string gnss_hash = 3;
+  string anchor_signature = 4;
+  string data_signature = 5;
+  int64  timestamp = 6;
+  string payload = 7;
+  string cert = 8;
+  string node_id = 9;
+}
+
+message MsgCreateClaimResponse {}

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.gradlew.bat build)",
+      "Bash(cmd /c gradlew.bat build)",
+      "Bash(cmd /c \"gradlew.bat build --stacktrace\")",
+      "Bash(.gradlew build --info)",
+      "Bash(powershell -Command \".\\\\gradlew.bat build\")"
+    ]
+  }
+}
