@@ -8,12 +8,12 @@ import android.util.Log
 import android.widget.Button
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
-// [변경] 바뀐 Proto 서비스와 메시지 임포트
+import com.example.contacticalattestation.v1.MsgCreateClaim
 import com.example.contacticalattestation.v1.MsgGrpcKt
 import com.example.contacticalattestation.v1.MsgRegisterNode
-import com.example.contacticalattestation.v1.MsgCreateClaim
 import io.grpc.ManagedChannelBuilder
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.security.KeyPairGenerator
@@ -26,19 +26,16 @@ class MainActivity : AppCompatActivity() {
     private val TAG = "KeyAttestation"
     private val KEY_ALIAS = "ContacticalKeyAlias"
 
-    // [중요] 실제 Ignite 체인에서 생성된 Alice 지갑 주소
-    // 블록체인에서는 이 주소가 곧 Node ID 역할을 합니다.
-    private val MY_WALLET_ADDRESS = "cosmos1y3d6pupvh0vnhvd9dhujsk5rvpw8hmj3r3jng9"
+    // 체인에서 사용 중인 Alice 주소
+    private val MY_WALLET_ADDRESS = "cosmos1nvmp58qukxmndy27z3tvjrx9yvek2p84r3clyg"
 
-    // gRPC 채널
     private val channel by lazy {
         ManagedChannelBuilder
-            .forAddress("10.0.2.2", 9095) // AVD(10.0.2.2) -> PC(localhost:9090)
+            .forAddress("10.0.2.2", 9095)
             .usePlaintext()
             .build()
     }
 
-    // [변경] Stub 이름이 MsgCoroutineStub으로 변경됨
     private val stub by lazy {
         MsgGrpcKt.MsgCoroutineStub(channel)
     }
@@ -65,12 +62,17 @@ class MainActivity : AppCompatActivity() {
     // 1단계: 키 생성 + 노드 등록
     private suspend fun registerNodeWithAttestation() = withContext(Dispatchers.IO) {
         try {
-            // 챌린지 생성
+            // 1) 챌린지 생성
             val challenge = ByteArray(32)
             Random.nextBytes(challenge)
             val challengeBase64 = Base64.encodeToString(challenge, Base64.NO_WRAP)
 
-            // TEE 키 생성
+            Log.i(TAG, "📌 Challenge bytes len=${challenge.size}")
+            Log.d(TAG, "📌 Challenge bytes: ${challenge.joinToString()}")
+            Log.i(TAG, "📌 Challenge Base64 len=${challengeBase64.length}")
+            Log.d(TAG, "📌 Challenge Base64: $challengeBase64")
+
+            // 2) TEE 키 생성
             val keyPairGenerator = KeyPairGenerator.getInstance(
                 KeyProperties.KEY_ALGORITHM_EC,
                 "AndroidKeyStore"
@@ -89,7 +91,7 @@ class MainActivity : AppCompatActivity() {
 
             Log.d(TAG, "✅ TEE Key Pair Generated")
 
-            // 인증서 체인 추출
+            // 3) 인증서 체인 추출
             val keyStore = KeyStore.getInstance("AndroidKeyStore")
             keyStore.load(null)
             val certs = keyStore.getCertificateChain(KEY_ALIAS)
@@ -99,32 +101,43 @@ class MainActivity : AppCompatActivity() {
                 return@withContext
             }
 
-            // Base64 인코딩
-            val certChainBase64 = certs.map { cert ->
-                Base64.encodeToString(cert.encoded, Base64.NO_WRAP)
-            }
-
             Log.i(TAG, "📜 Certificate Chain (${certs.size} certs)")
 
-            // [변경] MsgRegisterNode 사용
+            // Base64 인코딩 + 로그
+            val certChainBase64 = certs.mapIndexed { index, cert ->
+                val encoded = cert.encoded
+                val b64 = Base64.encodeToString(encoded, Base64.NO_WRAP)
+                Log.i(TAG, "🔑 Cert[$index] DER len=${encoded.size}")
+                Log.i(TAG, "🔑 Cert[$index] Base64 len=${b64.length}")
+                Log.d(TAG, "🔑 Cert[$index] Base64: $b64")
+                b64
+            }
+
+            // 4) MsgRegisterNode 생성
             val request = MsgRegisterNode.newBuilder()
-                .setCreator(MY_WALLET_ADDRESS) // [필수] 올바른 Bech32 주소
+                .setCreator(MY_WALLET_ADDRESS)
                 .addAllCertChain(certChainBase64)
                 .setChallenge(challengeBase64)
-                .setPubKey("임시_공개키_값") // 나중에 실제 키 로직으로 교체 가능
+                .setPubKey("임시_공개키_값")
                 .build()
 
-            Log.i(TAG, "📡 Calling RegisterNode RPC...")
+            Log.d(TAG, "📦 MsgRegisterNode.cert_chain[0] len=${request.certChainList[0].length}")
+            Log.d(TAG, "📦 MsgRegisterNode.challenge len=${request.challenge.length}")
 
-            // [변경] stub.registerNode 호출
+            Log.i(TAG, "📡 Calling RegisterNode RPC...")
             val response = stub.registerNode(request)
 
-            // [변경] response.nodeId 필드는 없음. 지갑 주소로 식별.
             if (response.success) {
                 Log.i(TAG, "✅ Node Registered! ID: $MY_WALLET_ADDRESS")
 
-                // 2단계: 데이터 서명 및 제출 (ID 대신 지갑주소 전달)
-                submitDataWithSignature(MY_WALLET_ADDRESS)
+                // 5초 정도 대기 후 Claim 제출
+                lifecycleScope.launch {
+                    Log.i(TAG, "⏳ Waiting 5 seconds for block confirmation...")
+                    delay(5000)
+
+                    Log.i(TAG, "🚀 Submitting data now...")
+                    submitDataWithSignature(MY_WALLET_ADDRESS)
+                }
             } else {
                 Log.e(TAG, "❌ Registration Failed (Success=false)")
             }
@@ -140,7 +153,6 @@ class MainActivity : AppCompatActivity() {
         try {
             val payload = "Hello Contactical"
 
-            // TEE로 서명 생성
             val keyStore = KeyStore.getInstance("AndroidKeyStore")
             keyStore.load(null)
 
@@ -156,33 +168,33 @@ class MainActivity : AppCompatActivity() {
             val signatureBytes = signature.sign()
             val signatureBase64 = Base64.encodeToString(signatureBytes, Base64.NO_WRAP)
 
-            // 인증서 가져오기
+            Log.i(TAG, "✍️ Signature bytes len=${signatureBytes.size}")
+            Log.d(TAG, "✍️ Signature bytes: ${signatureBytes.joinToString()}")
+            Log.i(TAG, "✍️ Signature Base64 len=${signatureBase64.length}")
+            Log.d(TAG, "✍️ Signature Base64: $signatureBase64")
+
             val certs = keyStore.getCertificateChain(KEY_ALIAS)
             val certBase64 = Base64.encodeToString(certs[0].encoded, Base64.NO_WRAP)
+            Log.i(TAG, "🔐 Claim Cert Base64 len=${certBase64.length}")
+            Log.d(TAG, "🔐 Claim Cert Base64: $certBase64")
 
-            Log.i(TAG, "✍️ Data Signed: $payload")
-
-            // [변경] MsgCreateClaim 사용 (필드명 주의)
             val request = MsgCreateClaim.newBuilder()
                 .setCreator(creatorAddress)
-                .setPayload(payload)              // 우리가 추가한 필드
-                .setDataSignature(signatureBase64) // proto: data_signature
-                .setCert(certBase64)              // 우리가 추가한 필드
-                .setTimestamp(System.currentTimeMillis() / 1000) // 현재 시간
-                // 아래 필드들은 Proto 정의상 필수이므로 더미 값이라도 넣어야 함
+                .setPayload(payload)
+                .setDataSignature(signatureBase64)
+                .setCert(certBase64)
+                .setTimestamp(System.currentTimeMillis() / 1000)
                 .setSensorHash("dummy_sensor_hash")
                 .setGnssHash("dummy_gnss_hash")
                 .setAnchorSignature("dummy_anchor_sig")
-                .setNodeId(creatorAddress)        // 우리가 추가한 필드 (선택)
+                .setNodeId(creatorAddress)
                 .build()
 
+            Log.d(TAG, "📦 MsgCreateClaim.data_signature len=${request.dataSignature.length}")
+            Log.d(TAG, "📦 MsgCreateClaim.cert len=${request.cert.length}")
+
             Log.i(TAG, "📡 Calling CreateClaim RPC...")
-
-            // [변경] stub.createClaim 호출
             val response = stub.createClaim(request)
-
-            // Cosmos Msg 응답은 보통 빈 객체({})면 성공입니다.
-            // gRPC 에러(Exception)가 안 났다면 성공으로 간주합니다.
             Log.i(TAG, "✅ Data Submitted Successfully!")
 
         } catch (e: Exception) {
