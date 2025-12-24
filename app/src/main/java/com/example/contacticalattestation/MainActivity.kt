@@ -1,204 +1,167 @@
 package com.example.contacticalattestation
 
+import android.content.Intent
 import android.os.Bundle
-import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyProperties
-import android.util.Base64
 import android.util.Log
 import android.widget.Button
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
-import com.example.contacticalattestation.v1.MsgCreateClaim
 import com.example.contacticalattestation.v1.MsgGrpcKt
 import com.example.contacticalattestation.v1.MsgRegisterNode
+import com.example.contacticalattestation.zk.ZkInputGenerator
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.android.gms.common.api.ApiException
+import com.google.protobuf.ByteString
 import io.grpc.ManagedChannelBuilder
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.security.KeyPairGenerator
-import java.security.KeyStore
-import java.security.Signature
-import kotlin.random.Random
+import java.nio.charset.StandardCharsets
 
 class MainActivity : AppCompatActivity() {
 
-    private val TAG = "KeyAttestation"
-    private val KEY_ALIAS = "ContacticalKeyAlias"
+    private val TAG = "ZkLogin"
+    private val RC_SIGN_IN = 9001
 
-    // 체인에서 사용 중인 Alice 주소
-    private val MY_WALLET_ADDRESS = "cosmos1nvmp58qukxmndy27z3tvjrx9yvek2p84r3clyg"
+    // 체인 주소
+    private val MY_WALLET_ADDRESS = "cosmos1yzzdt6epr46evz8uwn4etklqq2kqgvymr0n477"
 
     private val channel by lazy {
-        ManagedChannelBuilder
-            .forAddress("10.0.2.2", 9095)
-            .usePlaintext()
-            .build()
+        // 에뮬레이터 루프백 주소 (로컬 프록시 연결용)
+        ManagedChannelBuilder.forAddress("10.0.2.2", 9095).usePlaintext().build()
     }
-
-    private val stub by lazy {
-        MsgGrpcKt.MsgCoroutineStub(channel)
-    }
+    private val stub by lazy { MsgGrpcKt.MsgCoroutineStub(channel) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         val button = Button(this).apply {
-            text = "Generate TEE Key & Register Node"
-            setOnClickListener {
-                lifecycleScope.launch {
-                    registerNodeWithAttestation()
-                }
-            }
+            text = "Google Sign-In & ZK Register"
+            setOnClickListener { startGoogleSignIn() }
         }
         setContentView(button)
+    }
+
+    // 1. 구글 로그인 시작
+    private fun startGoogleSignIn() {
+        val gso = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+            .requestIdToken("1052539334492-463oh6ok57smp7q7uch055jh4bjj0mdv.apps.googleusercontent.com") // 구글 클라우드 콘솔 Client ID
+            .requestEmail()
+            .build()
+        val client = GoogleSignIn.getClient(this, gso)
+        startActivityForResult(client.signInIntent, RC_SIGN_IN)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == RC_SIGN_IN) {
+            val task = GoogleSignIn.getSignedInAccountFromIntent(data)
+            try {
+                val account = task.getResult(ApiException::class.java)
+                val idToken = account.idToken
+                Log.d(TAG, "ID Token: $idToken")
+
+                if (idToken != null) {
+                    lifecycleScope.launch { processZkRegistration(idToken) }
+                }
+            } catch (e: ApiException) {
+                Log.w(TAG, "SignIn failed code=${e.statusCode}")
+            }
+        }
+    }
+
+    // processZkRegistration 함수 전체 수정
+
+    private suspend fun processZkRegistration(idToken: String) = withContext(Dispatchers.IO) {
+        try {
+            // ----------------------------------------------------------------
+            // 1. TEE Key Pair 생성 및 인증서 추출 (이 부분이 누락되었을 수 있음)
+            // ----------------------------------------------------------------
+            val keyStore = java.security.KeyStore.getInstance("AndroidKeyStore")
+            keyStore.load(null)
+
+            // 키가 없으면 새로 생성
+            if (!keyStore.containsAlias("ContacticalKeyAlias")) {
+                val keyPairGenerator = java.security.KeyPairGenerator.getInstance(
+                    android.security.keystore.KeyProperties.KEY_ALGORITHM_EC,
+                    "AndroidKeyStore"
+                )
+                val spec = android.security.keystore.KeyGenParameterSpec.Builder(
+                    "ContacticalKeyAlias",
+                    android.security.keystore.KeyProperties.PURPOSE_SIGN
+                )
+                    .setDigests(android.security.keystore.KeyProperties.DIGEST_SHA256)
+                    .setAttestationChallenge("dummy_challenge".toByteArray()) // 챌린지 설정
+                    .build()
+
+                keyPairGenerator.initialize(spec)
+                keyPairGenerator.generateKeyPair()
+                Log.d(TAG, "✅ New TEE Key Generated")
+            }
+
+            // 인증서 체인 가져오기
+            val certs = keyStore.getCertificateChain("ContacticalKeyAlias")
+            if (certs == null || certs.isEmpty()) {
+                Log.e(TAG, "❌ Failed to get certificate chain. Is this a real device?")
+                return@withContext
+            }
+
+            // 인증서를 Base64 문자열 리스트로 변환
+            val certChainBase64 = certs.map { cert ->
+                android.util.Base64.encodeToString(cert.encoded, android.util.Base64.NO_WRAP)
+            }
+            Log.d(TAG, "📜 Cert Chain Size: ${certChainBase64.size}")
+
+            // PubKey 추출 (Key_A)
+            val devicePubKey = certs[0].publicKey.toString() // 또는 encoded 된 값을 사용해도 됨
+
+            // ----------------------------------------------------------------
+            // 2. ZK 로직 (기존 코드)
+            // ----------------------------------------------------------------
+            val generator = ZkInputGenerator()
+            val zkInputJson = generator.generateInput(idToken, devicePubKey)
+
+            val proofBytes = loadAssetProof()
+            val publicSignals = listOf("1", "1")
+
+            // ----------------------------------------------------------------
+            // 3. 전송 (ZK Proof + TEE Certs)
+            // ----------------------------------------------------------------
+            val request = MsgRegisterNode.newBuilder()
+                .setCreator(MY_WALLET_ADDRESS)
+                .setZkProof(ByteString.copyFrom(proofBytes))
+                .addAllPublicSignals(publicSignals)
+                .setPubKey(devicePubKey)
+                // [중요] 여기를 꼭 추가해야 합니다!
+                .addAllCertChain(certChainBase64)
+                .build()
+
+            Log.i(TAG, "📡 Sending RegisterNode to Proxy...")
+            val response = stub.registerNode(request)
+
+            if (response.success) {
+                Log.i(TAG, "✅ Success! Node Registered via ZK + TEE.")
+            } else {
+                Log.e(TAG, "❌ Failed.")
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error: ${e.message}", e)
+            e.printStackTrace()
+        }
+    }
+
+    private fun loadAssetProof(): ByteArray {
+        // assets 폴더에 proof.json을 넣어두세요.
+        return try {
+            assets.open("proof.json").use { it.readBytes() }
+        } catch (e: Exception) {
+            ByteArray(0)
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         channel.shutdown()
-    }
-
-    // 1단계: 키 생성 + 노드 등록
-    private suspend fun registerNodeWithAttestation() = withContext(Dispatchers.IO) {
-        try {
-            // 1) 챌린지 생성
-            val challenge = ByteArray(32)
-            Random.nextBytes(challenge)
-            val challengeBase64 = Base64.encodeToString(challenge, Base64.NO_WRAP)
-
-            Log.i(TAG, "📌 Challenge bytes len=${challenge.size}")
-            Log.d(TAG, "📌 Challenge bytes: ${challenge.joinToString()}")
-            Log.i(TAG, "📌 Challenge Base64 len=${challengeBase64.length}")
-            Log.d(TAG, "📌 Challenge Base64: $challengeBase64")
-
-            // 2) TEE 키 생성
-            val keyPairGenerator = KeyPairGenerator.getInstance(
-                KeyProperties.KEY_ALGORITHM_EC,
-                "AndroidKeyStore"
-            )
-
-            val spec = KeyGenParameterSpec.Builder(
-                KEY_ALIAS,
-                KeyProperties.PURPOSE_SIGN
-            )
-                .setDigests(KeyProperties.DIGEST_SHA256)
-                .setAttestationChallenge(challenge)
-                .build()
-
-            keyPairGenerator.initialize(spec)
-            keyPairGenerator.generateKeyPair()
-
-            Log.d(TAG, "✅ TEE Key Pair Generated")
-
-            // 3) 인증서 체인 추출
-            val keyStore = KeyStore.getInstance("AndroidKeyStore")
-            keyStore.load(null)
-            val certs = keyStore.getCertificateChain(KEY_ALIAS)
-
-            if (certs == null || certs.isEmpty()) {
-                Log.e(TAG, "❌ Certificate chain is empty")
-                return@withContext
-            }
-
-            Log.i(TAG, "📜 Certificate Chain (${certs.size} certs)")
-
-            // Base64 인코딩 + 로그
-            val certChainBase64 = certs.mapIndexed { index, cert ->
-                val encoded = cert.encoded
-                val b64 = Base64.encodeToString(encoded, Base64.NO_WRAP)
-                Log.i(TAG, "🔑 Cert[$index] DER len=${encoded.size}")
-                Log.i(TAG, "🔑 Cert[$index] Base64 len=${b64.length}")
-                Log.d(TAG, "🔑 Cert[$index] Base64: $b64")
-                b64
-            }
-
-            // 4) MsgRegisterNode 생성
-            val request = MsgRegisterNode.newBuilder()
-                .setCreator(MY_WALLET_ADDRESS)
-                .addAllCertChain(certChainBase64)
-                .setChallenge(challengeBase64)
-                .setPubKey("임시_공개키_값")
-                .build()
-
-            Log.d(TAG, "📦 MsgRegisterNode.cert_chain[0] len=${request.certChainList[0].length}")
-            Log.d(TAG, "📦 MsgRegisterNode.challenge len=${request.challenge.length}")
-
-            Log.i(TAG, "📡 Calling RegisterNode RPC...")
-            val response = stub.registerNode(request)
-
-            if (response.success) {
-                Log.i(TAG, "✅ Node Registered! ID: $MY_WALLET_ADDRESS")
-
-                // 5초 정도 대기 후 Claim 제출
-                lifecycleScope.launch {
-                    Log.i(TAG, "⏳ Waiting 5 seconds for block confirmation...")
-                    delay(5000)
-
-                    Log.i(TAG, "🚀 Submitting data now...")
-                    submitDataWithSignature(MY_WALLET_ADDRESS)
-                }
-            } else {
-                Log.e(TAG, "❌ Registration Failed (Success=false)")
-            }
-
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error during registration: ${e.message}", e)
-            e.printStackTrace()
-        }
-    }
-
-    // 2단계: 데이터 서명 + 제출
-    private suspend fun submitDataWithSignature(creatorAddress: String) = withContext(Dispatchers.IO) {
-        try {
-            val payload = "Hello Contactical"
-
-            val keyStore = KeyStore.getInstance("AndroidKeyStore")
-            keyStore.load(null)
-
-            val entry = keyStore.getEntry(KEY_ALIAS, null) as? KeyStore.PrivateKeyEntry
-            if (entry == null) {
-                Log.e(TAG, "❌ Private key not found")
-                return@withContext
-            }
-
-            val signature = Signature.getInstance("SHA256withECDSA")
-            signature.initSign(entry.privateKey)
-            signature.update(payload.toByteArray(Charsets.UTF_8))
-            val signatureBytes = signature.sign()
-            val signatureBase64 = Base64.encodeToString(signatureBytes, Base64.NO_WRAP)
-
-            Log.i(TAG, "✍️ Signature bytes len=${signatureBytes.size}")
-            Log.d(TAG, "✍️ Signature bytes: ${signatureBytes.joinToString()}")
-            Log.i(TAG, "✍️ Signature Base64 len=${signatureBase64.length}")
-            Log.d(TAG, "✍️ Signature Base64: $signatureBase64")
-
-            val certs = keyStore.getCertificateChain(KEY_ALIAS)
-            val certBase64 = Base64.encodeToString(certs[0].encoded, Base64.NO_WRAP)
-            Log.i(TAG, "🔐 Claim Cert Base64 len=${certBase64.length}")
-            Log.d(TAG, "🔐 Claim Cert Base64: $certBase64")
-
-            val request = MsgCreateClaim.newBuilder()
-                .setCreator(creatorAddress)
-                .setPayload(payload)
-                .setDataSignature(signatureBase64)
-                .setCert(certBase64)
-                .setTimestamp(System.currentTimeMillis() / 1000)
-                .setSensorHash("dummy_sensor_hash")
-                .setGnssHash("dummy_gnss_hash")
-                .setAnchorSignature("dummy_anchor_sig")
-                .setNodeId(creatorAddress)
-                .build()
-
-            Log.d(TAG, "📦 MsgCreateClaim.data_signature len=${request.dataSignature.length}")
-            Log.d(TAG, "📦 MsgCreateClaim.cert len=${request.cert.length}")
-
-            Log.i(TAG, "📡 Calling CreateClaim RPC...")
-            val response = stub.createClaim(request)
-            Log.i(TAG, "✅ Data Submitted Successfully!")
-
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error during data submission: ${e.message}", e)
-        }
     }
 }

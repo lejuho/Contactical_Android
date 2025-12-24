@@ -81,6 +81,15 @@ dependencies {
     // OkHttp for network requests
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // 1. Google Sign-In
+    implementation("com.google.android.gms:play-services-auth:20.7.0")
+
+    // 2. JWT 디코딩 (선택사항, 기본 Base64로도 가능하지만 편의상)
+    implementation("com.auth0.android:jwtdecode:2.0.2")
+
+    // 3. JSON 처리
+    implementation("com.google.code.gson:gson:2.10.1")
+
     // gRPC and Protobuf
     implementation("io.grpc:grpc-okhttp:1.60.0")
     implementation("io.grpc:grpc-protobuf:1.60.0")
